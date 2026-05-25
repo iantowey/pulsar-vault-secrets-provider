@@ -9,7 +9,6 @@ The `functions_worker.yml` needs to be configured to use the secrets provider wi
 
 #### Links
 
-https://acme.atlassian.net/browse/DEVTOOLS-2229
 
 #### Demo
 
