@@ -1,0 +1,141 @@
+services:
+  # ── Vault server (dev mode) ──
+  vault:
+    image: hashicorp/vault:latest
+    container_name: vault-server
+    ports:
+      - "8200:8200"
+    environment:
+      VAULT_DEV_ROOT_TOKEN_ID: "root"
+      VAULT_DEV_LISTEN_ADDRESS: "0.0.0.0:8200"
+      VAULT_ADDR: "http://127.0.0.1:8200"
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - ./vault-data:/vault/file
+    command: server -dev -dev-root-token-id=root -dev-listen-address=0.0.0.0:8200 -dev-kv-v1
+    healthcheck:
+      test: ["CMD", "vault", "status"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      vault-net:
+        ipv4_address: 172.20.0.10
+
+  # ── One-shot setup: enables AppRole, creates role & secret, exports role_id ──
+  vault-setup:
+    image: hashicorp/vault:latest
+    container_name: vault-setup
+    depends_on:
+      vault:
+        condition: service_healthy
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+      VAULT_TOKEN: "root"
+    volumes:
+      - ./docker/setup.sh:/setup.sh:ro
+      - shared-data:/shared
+    command: sh /setup.sh
+    networks:
+      vault-net:
+        ipv4_address: 172.20.0.30
+
+  # ── Vault Agent ──
+  #   Static IP 172.20.0.20 — this is what token_bound_cidrs is set to.
+  vault-agent:
+    image: hashicorp/vault:latest
+    container_name: vault-agent
+    depends_on:
+      vault-setup:
+        condition: service_completed_successfully
+    cap_add:
+      - IPC_LOCK
+    volumes:
+      - ./docker/agent-config.hcl:/etc/vault/agent-config.hcl:ro
+      - shared-data:/shared:ro
+      - agent-token:/tmp/vault-agent-token
+    environment:
+      VAULT_ADDR: "http://vault:8200"
+    entrypoint: /bin/sh
+    command:
+      - -c
+      - |
+        chown vault:vault /tmp/vault-agent-token
+        su-exec vault vault agent -config=/etc/vault/agent-config.hcl -log-level=trace
+    networks:
+      vault-net:
+        ipv4_address: 172.20.0.20
+
+  # ── Demo app: proves the CIDR restriction works ──
+  demo-app:
+    image: alpine:latest
+    container_name: demo-app
+    depends_on:
+      - vault-agent
+    volumes:
+      - agent-token:/tmp/vault-agent-token:ro
+      - ./docker/demo.sh:/demo.sh:ro
+    command: sh /demo.sh
+    networks:
+      vault-net:
+        ipv4_address: 172.20.0.40
+
+  pulsar:
+    container_name: pulsar
+    build:
+      context: .
+      dockerfile: docker/pulsar/Dockerfile
+    depends_on:
+      - vault-agent
+    ports:
+      - "6650:6650"     # Pulsar binary protocol (clients)
+      - "8080:8080"     # Admin/REST + Functions API
+    environment:
+      # Force standalone mode with functions enabled (default), but minimize Bookie usage
+      - PULSAR_STANDALONE_USE_ZOOKEEPER=true
+      - bookkeeperMemoryNodes=true               # Critical: use in-memory ledgers (disables real disk Bookie storage)
+      - PULSAR_MEM=-Xmx512m -Xms512m             # Keep memory low for local dev
+      - PULSAR_LOG_LEVEL=INFO
+      - PF_secretsProviderConfiguratorClassName=com.ostk.pulsar.extensions.secrets.VaultSecretsProviderConfigurator
+      - PF_secretsProviderConfiguratorConfig_pulsarCluster=midgard
+      - PF_secretsProviderConfiguratorConfig_vaultNamespace=dpo
+      - PF_secretsProviderConfiguratorConfig_vaultAddress=http://vault-agent:8201
+      - PF_secretsProviderConfiguratorConfig_vaultRootPath=secret/umf/pulsar/midgard
+      - PF_secretsProviderConfiguratorConfig_vaultAppRoleName=dataeng-role
+      - PF_secretsProviderConfiguratorConfig_vaultOpenTimeout=30
+      - PF_secretsProviderConfiguratorConfig_vaultReadTimeout=30
+      - PF_secretsProviderConfiguratorConfig_vaultMaxRetries=5
+      - PF_secretsProviderConfiguratorConfig_vaultRetryInterval=5
+      - PULSAR_EXTRA_CLASSPATH=/pulsar/lib/pulsar-vault-secrets-1.0.0-SNAPSHOT.jar
+      - PRE_CLASSPATH=/pulsar/lib/pulsar-vault-secrets-1.0.0-SNAPSHOT.jar
+    command: >
+      bash -c "
+        export PF_secretsProviderConfiguratorConfig_vaultAppRoleId=$$(cat /shared/role_id) &&
+        bin/apply-config-from-env.py conf/standalone.conf &&
+        bin/apply-config-from-env.py conf/broker.conf &&
+        bin/apply-config-from-env.py conf/bookkeeper.conf &&
+        bin/gen-yml-from-env.py conf/functions_worker.yml &&
+        exec bin/pulsar standalone -nss
+      "
+    healthcheck:
+      test: [ "CMD", "curl", "-f", "http://localhost:8080/admin/v2/brokers/health" ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - shared-data:/shared:ro
+    networks:
+      vault-net:
+        ipv4_address: 172.20.0.50
+
+networks:
+  vault-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+volumes:
+  shared-data:
+  agent-token:
